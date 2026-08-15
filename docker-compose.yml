@@ -1,0 +1,50 @@
+services:
+  omai-app:
+    build:
+      context: .
+      dockerfile: Dockerfile.app
+      args:
+        VITE_OPENCODE_SERVER_HOST: ${OPENCODE_HOST}
+        VITE_OPENCODE_SERVER_PORT: ${OPENCODE_SERVER_PORT}
+        VITE_OPENCODE_SERVER_PROTOCOL: ${OPENCODE_SERVER_PROTOCOL}
+    network_mode: host
+    environment:
+      - OPENCODE_HOST=${OPENCODE_HOST}
+    depends_on:
+      omai-opencode:
+        condition: service_healthy
+    restart: unless-stopped
+
+  omai-opencode:
+    build:
+      context: .
+      dockerfile: Dockerfile.opencode
+      args:
+        OPENCODE_HOST: ${OPENCODE_HOST}
+        MODELS_DEV_API_JSON: ${MODELS_DEV_API_JSON:-}
+    network_mode: host
+    volumes:
+      - omai-data:/home/runner/.local/share/opencode
+      - omai-projects:/home/runner/workspace/projects
+      - ./.opencode/opencode.jsonc:/home/runner/.config/opencode/opencode.jsonc
+    environment:
+      - NODE_ENV=development
+      - OPENCODE_HOST=${OPENCODE_HOST}
+      - OPENCODE_SERVER_PORT=${OPENCODE_SERVER_PORT}
+      - OPENCODE_FRONTEND_PORT=${OPENCODE_FRONTEND_PORT}
+      - OPENCODE_SERVER_PROTOCOL=${OPENCODE_SERVER_PROTOCOL}
+      - OPENCODE_DOCKER=1
+      - OPENCODE_UI_UPSTREAM=http://localhost:80
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:4096/global/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+    restart: unless-stopped
+
+volumes:
+  omai-data:
+    driver: local
+  omai-projects:
+    driver: local

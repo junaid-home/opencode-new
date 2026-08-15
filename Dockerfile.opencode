@@ -1,0 +1,76 @@
+# Stage 1: Build packages/opencode binary from source
+FROM oven/bun:1 AS builder
+
+WORKDIR /app
+
+# Install build dependencies
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    python3 make g++ git ripgrep \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy entire repo
+COPY . .
+
+# Remove lockfile and whitelist only packages needed for server build
+RUN rm -f bun.lock && \
+    bun -e 'var p=JSON.parse(require("fs").readFileSync("package.json","utf8"));p.workspaces.packages=["packages/opencode","packages/app","packages/script","packages/plugin","packages/sdk/js","packages/core","packages/server","packages/protocol","packages/schema","packages/session-ui","packages/llm","packages/codemode","packages/tui","packages/http-recorder","packages/effect-drizzle-sqlite","packages/effect-sqlite-node","packages/ui"];p.devDependencies={"prettier":"3.6.2"};require("fs").writeFileSync("package.json",JSON.stringify(p,null,2))'
+
+# Install dependencies
+RUN bun install --ignore-scripts
+RUN bun run --cwd packages/core fix-node-pty
+
+# Init git repo (build script needs git branch info, .git is excluded by .dockerignore)
+RUN mkdir -p .github && touch .github/TEAM_MEMBERS && \
+    git config --global user.email "info@omai+.ai" && \
+    git config --global user.name "OMAI+" && \
+    git init && echo "node_modules" > .gitignore && git add -A && git commit -m "init"
+
+# Build the binary (remove prepare scripts so bun add doesn't fail on missing husky)
+# MODELS_DEV_API_JSON can be passed as build arg to use a local pre-fetched file
+ARG MODELS_DEV_API_JSON=""
+RUN bun -e 'var p=JSON.parse(require("fs").readFileSync("package.json","utf8"));delete p.scripts.prepare;require("fs").writeFileSync("package.json",JSON.stringify(p,null,2))' && \
+    bun -e 'var p=JSON.parse(require("fs").readFileSync("packages/opencode/package.json","utf8"));delete p.scripts.prepare;require("fs").writeFileSync("packages/opencode/package.json",JSON.stringify(p,null,2))' && \
+    MODELS_DEV_API_JSON=${MODELS_DEV_API_JSON} bun run --cwd packages/opencode build -- --single
+
+# Verify and locate binary
+RUN BINARY=$(find packages/opencode/dist -name "opencode" -type f | head -1) && \
+    $BINARY --version && \
+    cp "$BINARY" /usr/local/bin/opencode
+
+# Stage 2: Runtime
+FROM debian:bookworm-slim
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    git ripgrep curl ca-certificates sudo gnupg \
+    && mkdir -p /etc/apt/keyrings \
+    && curl -fsSL https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key | gpg --dearmor -o /etc/apt/keyrings/nodesource.gpg \
+    && echo "deb [signed-by=/etc/apt/keyrings/nodesource.gpg] https://deb.nodesource.com/node_22.x nodistro main" | tee /etc/apt/sources.list.d/nodesource.list \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends nodejs \
+    && npm install -g pnpm bun \
+    && rm -rf /var/lib/apt/lists/*
+
+# Create runner user with sudo access
+RUN useradd -m -s /bin/bash runner && \
+    echo "runner ALL=(ALL) NOPASSWD:ALL" >> /etc/sudoers.d/runner && \
+    chown runner:runner /root
+
+# Copy the built binary
+COPY --from=builder /usr/local/bin/opencode /usr/local/bin/opencode
+RUN opencode --version
+
+ARG OPENCODE_HOST
+ARG OPENCODE_SERVER_PORT=4096
+ENV OPENCODE_HOST=${OPENCODE_HOST}
+ENV OPENCODE_SERVER_PORT=${OPENCODE_SERVER_PORT}
+
+# Create entrypoint script
+RUN printf '#!/bin/sh\nset -e\nsudo mkdir -p /home/runner/.local/share/opencode /home/runner/.local/state /home/runner/.cache/opencode /home/runner/.config/opencode /home/runner/workspace/projects\nsudo chown -R runner:runner /home/runner/.local /home/runner/.cache /home/runner/.config /home/runner/workspace /root\nexec opencode serve --hostname 0.0.0.0 --cors "http://${OPENCODE_HOST}" --cors "http://${OPENCODE_HOST}:${OPENCODE_FRONTEND_PORT}" --cors "https://${OPENCODE_HOST}" --cors "https://${OPENCODE_HOST}:${OPENCODE_FRONTEND_PORT}" --port ${OPENCODE_SERVER_PORT}\n' \
+    > /usr/local/bin/entrypoint.sh && chmod +x /usr/local/bin/entrypoint.sh
+
+# Set up workspace as runner user
+USER runner
+WORKDIR /home/runner
+
+# Ports accessible via network_mode: host
+ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
